@@ -1,30 +1,44 @@
 """
-ModelSubmission — Momentum with Risk Management v10
-====================================================
+ModelSubmission — Generation 6: Mean Reversion + Momentum Hybrid
+=================================================================
 
-Philosophy shift from v9:
-Previous versions were too conservative — 2 trades in 600 ticks is
-not a trading strategy. We were so focused on avoiding losses that
-we forgot to make money.
+Core insight from research log:
+  Win rate: 24%, Avg win: $35, Avg loss: $105, Ratio: 3:1 (bad)
+  Need either higher win rate OR better risk/reward ratio
+  
+Mean reversion addresses both:
+  - Higher win rate: prices tend to revert to 0.50 early in events
+  - Better risk/reward: target 0.12 profit vs 0.08 stop = 1.5:1
 
-New approach: baseline momentum signal + proper risk management
-- Entry: similar to MomentumBaseline (follow momentum)
-  but with spread quality gate and position size cap
-- Risk: hard stop loss per trade (prevents -$13k disasters)  
-- Exit: momentum reversal OR profit take at extreme prices
-- Size: fixed fraction of capital, never leveraged
+Strategy:
+  Phase 1 (TTR > 150s): MEAN REVERSION
+    - Token market is uncertain, noise trader dominated
+    - Prices oscillate around 0.50
+    - Buy UP when up_mid < 0.40 (oversold), target 0.50
+    - Buy DOWN when up_mid > 0.60 (overbought), target 0.50
+    - Stop loss if move continues against us by 0.08
+    
+  Phase 2 (TTR 60-150s): MOMENTUM
+    - Direction has established, follow the trend
+    - Only enter on strong confirmed momentum
+    - Tighter position size, faster exit
+    
+  Phase 3 (TTR < 60s): FLAT
+    - Resolution lottery, insider-dominated
+    - No exceptions
 
-The baseline problem is NOT its signal — it's that it has no
-stop loss and sizes up to 5x capital. When momentum reverses,
-it bleeds out completely. Our fix: same signal, bounded risk.
-
-Key differences from baseline:
-1. Size capped at 0.30 of capital (baseline goes to 5x)
-2. Hard stop loss: exit if trade loses > 25% of position value
-3. Event stop: if down > 15% in event, sit out rest of event
-4. Force flat at TTR < 60s (avoid resolution lottery)
-5. Spread gate: only trade when spread < 0.08
-6. No re-entry during cooldown after stop loss
+Risk/Reward Design:
+  Mean reversion trade:
+    Entry: up_mid = 0.62 (buying DOWN)
+    Target: up_mid = 0.52 → profit = 0.10 per share
+    Stop:   up_mid = 0.70 → loss = 0.08 per share
+    R/R = 1.25:1 minimum, win rate target > 55%
+    
+  Momentum trade:
+    Entry: confirmed trend with 30s lookback
+    Target: profit-take at 0.82/0.18
+    Stop: 20% of notional
+    R/R = variable, win rate target > 45%
 """
 
 from __future__ import annotations
@@ -41,50 +55,63 @@ class ModelSubmission(Model):
 
         self._capital = float(self.config.get("starting_capital", 1000.0))
 
-        # --- Core momentum parameters (similar to baseline) ---
-        self._lookback_s = int(self.config.get("lookback_s", 30))
-        self._pm_threshold = float(self.config.get("pm_threshold", 0.012))
-        self._pm_per_unit = float(self.config.get("pm_per_unit", 0.06))
-
-        # --- Position sizing (HARD CAP — prevents leverage) ---
-        self._max_size = float(self.config.get("max_size", 0.30))
-
-        # --- Risk management ---
-        self._stop_loss_pct = float(self.config.get("stop_loss_pct", 0.25))
-        self._event_max_loss = float(self.config.get("event_max_loss", 0.15))
+        # --- Phase boundaries ---
+        self._mean_rev_ttr = float(self.config.get("mean_rev_ttr", 150.0))
         self._force_flat_ttr = float(self.config.get("force_flat_ttr", 60.0))
 
-        # --- Quality gates ---
+        # --- Mean reversion parameters ---
+        # Entry: fade when token moves this far from 0.50
+        self._mr_entry_threshold = float(self.config.get("mr_entry_threshold", 0.10))
+        # Target: exit when token returns this close to 0.50
+        self._mr_target = float(self.config.get("mr_target", 0.52))
+        # Stop: exit if move continues this far beyond entry
+        self._mr_stop_move = float(self.config.get("mr_stop_move", 0.08))
+        # Size: fraction of capital for mean reversion trades
+        self._mr_size = float(self.config.get("mr_size", 0.25))
+
+        # --- Momentum parameters ---
+        self._mom_lookback = int(self.config.get("mom_lookback", 30))
+        self._mom_threshold = float(self.config.get("mom_threshold", 0.015))
+        self._mom_size = float(self.config.get("mom_size", 0.20))
+        self._mom_profit_take_high = float(self.config.get("mom_profit_take_high", 0.82))
+        self._mom_profit_take_low = float(self.config.get("mom_profit_take_low", 0.18))
+
+        # --- Shared risk parameters ---
         self._max_spread = float(self.config.get("max_spread", 0.08))
-        self._min_ttr = float(self.config.get("min_ttr", 65.0))
+        self._stop_loss_pct = float(self.config.get("stop_loss_pct", 0.25))
+        self._event_max_loss = float(self.config.get("event_max_loss", 0.15))
+        self._warmup_ticks = int(self.config.get("warmup_ticks", 30))
 
-        # --- Profit take at extreme prices ---
-        self._profit_take_high = float(self.config.get("profit_take_high", 0.88))
-        self._profit_take_low = float(self.config.get("profit_take_low", 0.12))
-
-        # --- Cooldown after stop loss ---
-        self._cooldown_after_stop = int(self.config.get("cooldown_after_stop", 20))
+        # --- Cooldowns ---
+        self._cooldown_profit = int(self.config.get("cooldown_profit", 5))
+        self._cooldown_stop = int(self.config.get("cooldown_stop", 20))
 
         # --- State ---
         self._side = Side.FLAT
         self._shares = 0.0
         self._entry_price = 0.0
         self._entry_notional = 0.0
+        self._entry_up_mid = 0.0   # up_mid at entry (for mean reversion target)
         self._current_cash = self._capital
         self._event_start_cash = self._capital
         self._stopped_out = False
-        self._ticks_since_stop = 999
+        self._ticks_since_exit = 999
+        self._cooldown_required = 5
         self._tick_count = 0
+        self._trade_type = ""  # "mr" or "mom"
 
     def on_start(self, market_info: MarketInfo) -> None:
         self._side = Side.FLAT
         self._shares = 0.0
         self._entry_price = 0.0
         self._entry_notional = 0.0
+        self._entry_up_mid = 0.0
         self._event_start_cash = self._current_cash
         self._stopped_out = False
-        self._ticks_since_stop = 999
+        self._ticks_since_exit = 999
+        self._cooldown_required = self._cooldown_profit
         self._tick_count = 0
+        self._trade_type = ""
 
     def on_finish(self, result: RunResult) -> None:
         pass
@@ -93,17 +120,21 @@ class ModelSubmission(Model):
         self._tick_count += 1
 
         if self._side == Side.FLAT:
-            self._ticks_since_stop += 1
+            self._ticks_since_exit += 1
 
-        # Force flat near resolution
+        # Phase 3: flat
         if tick.time_to_resolve <= self._force_flat_ttr:
             return self._go_flat(stop=False)
 
-        # Stopped out for this event
+        # Event stopped out
         if self._stopped_out:
             return FLAT
 
-        # Need valid book
+        # Warmup
+        if self._tick_count < self._warmup_ticks:
+            return FLAT
+
+        # Valid book
         if not self._book_valid(tick):
             return self._go_flat(stop=True)
 
@@ -114,95 +145,177 @@ class ModelSubmission(Model):
                 return self._hold(tick)
             return FLAT
 
-        # TTR gate
-        if tick.time_to_resolve < self._min_ttr:
-            return self._go_flat(stop=False)
-
-        # Cooldown after stop loss
-        if self._ticks_since_stop < self._cooldown_after_stop:
-            if self._side != Side.FLAT:
-                return self._manage_position(tick)
-            return FLAT
-
-        # Compute momentum signal (same as baseline)
-        momentum_signal = self._polymarket_momentum(tick)
-
         # Manage existing position
         if self._side != Side.FLAT:
             return self._manage_position(tick)
 
-        # Enter on momentum signal
-        return self._try_enter(tick, momentum_signal)
+        # Cooldown
+        if self._ticks_since_exit < self._cooldown_required:
+            return FLAT
 
-    def _polymarket_momentum(self, tick: Tick) -> tuple[Side | None, float]:
+        # Phase selection
+        in_mean_rev = tick.time_to_resolve > self._mean_rev_ttr
+        in_momentum = self._force_flat_ttr < tick.time_to_resolve <= self._mean_rev_ttr
+
+        if in_mean_rev:
+            return self._mean_reversion_entry(tick)
+        elif in_momentum:
+            return self._momentum_entry(tick)
+
+        return FLAT
+
+    # ------------------------------------------------------------------ #
+    #  Mean Reversion Entry                                                #
+    # ------------------------------------------------------------------ #
+
+    def _mean_reversion_entry(self, tick: Tick) -> Signal:
         """
-        Mirror of MomentumBaseline._polymarket_momentum but returns
-        (side, magnitude) tuple instead of Signal directly.
-        This lets us apply our own risk management on top.
+        Fade moves away from 0.50 early in the event.
+        
+        Logic: Early in a 5-min event, the market is uncertain.
+        Token prices oscillate around 0.50 as noise traders and 
+        momentum followers push prices around. When price moves
+        significantly from 0.50, fade it back.
+        
+        Key difference from momentum: we're betting ON reversion
+        not on continuation. Higher win rate, lower individual gain.
+        """
+        deviation = tick.up_mid - 0.50
+
+        # Token too high → fade with DOWN (expect reversion to 0.50)
+        if deviation > self._mr_entry_threshold:
+            # Don't fade if spread is too wide (low conviction market)
+            if spread := (tick.up_ask - tick.up_bid) > self._max_spread * 0.7:
+                return FLAT
+            # Don't fade if we're already at extreme (might continue)
+            if tick.up_mid > 0.75:
+                return FLAT
+            return self._enter_mr(
+                Side.DOWN, tick.down_ask, tick.down_bid,
+                tick.up_mid, self._mr_size
+            )
+
+        # Token too low → fade with UP (expect reversion to 0.50)
+        if deviation < -self._mr_entry_threshold:
+            if tick.up_mid < 0.25:
+                return FLAT
+            return self._enter_mr(
+                Side.UP, tick.up_ask, tick.up_bid,
+                tick.up_mid, self._mr_size
+            )
+
+        return FLAT
+
+    # ------------------------------------------------------------------ #
+    #  Momentum Entry                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _momentum_entry(self, tick: Tick) -> Signal:
+        """
+        Follow confirmed momentum in the middle phase.
+        Direction has established by now, ride the trend.
         """
         window = tick.up_mid_recent
-        if len(window) < 2:
-            return (None, 0.0)
-
-        offset = min(len(window) - 1, self._lookback_s)
-        past = window[-1 - offset]
-        now_price = window[-1]
-        if past <= 0.0 or now_price <= 0.0:
-            return (None, 0.0)
-
-        move = now_price - past
-        if abs(move) < self._pm_threshold:
-            return (None, 0.0)
-
-        magnitude = min(abs(move) / self._pm_per_unit, self._max_size)
-        side = Side.UP if move > 0 else Side.DOWN
-        return (side, magnitude)
-
-    def _try_enter(self, tick: Tick, signal: tuple) -> Signal:
-        side, magnitude = signal
-        if side is None or magnitude <= 0:
+        if len(window) < self._mom_lookback + 1:
             return FLAT
 
-        # Profit take gates — don't enter if already at extreme
-        if side == Side.UP and tick.up_mid > self._profit_take_high:
-            return FLAT
-        if side == Side.DOWN and tick.up_mid < self._profit_take_low:
-            return FLAT
-
-        if side == Side.UP:
-            ask = tick.up_ask
-            bid = tick.up_bid
-        else:
-            ask = tick.down_ask
-            bid = tick.down_bid
-
-        if ask <= 0 or bid <= 0 or ask <= bid:
+        past = window[-1 - self._mom_lookback]
+        now = window[-1]
+        if past <= 0 or now <= 0:
             return FLAT
 
-        # Size: use momentum magnitude but cap at max_size
-        size = self._clamp(magnitude, 0.0, self._max_size)
-        available = max(0.0, self._current_cash)
-        notional = min(size * self._capital, available)
-        if notional <= 0:
+        move = now - past
+        if abs(move) < self._mom_threshold:
             return FLAT
 
-        self._side = side
-        self._shares = notional / ask
-        self._entry_price = ask
-        self._entry_notional = notional
-        self._current_cash -= notional
-        self._ticks_since_stop = 999
+        # Don't enter at extremes
+        if now > 0.75 or now < 0.25:
+            return FLAT
 
-        return Signal(side=side, size=notional / self._capital, confidence=0.6)
+        if move > self._mom_threshold:
+            return self._enter_mom(
+                Side.UP, tick.up_ask, tick.up_bid,
+                self._mom_size
+            )
+        if move < -self._mom_threshold:
+            return self._enter_mom(
+                Side.DOWN, tick.down_ask, tick.down_bid,
+                self._mom_size
+            )
+
+        return FLAT
+
+    # ------------------------------------------------------------------ #
+    #  Position Management                                                 #
+    # ------------------------------------------------------------------ #
 
     def _manage_position(self, tick: Tick) -> Signal:
-        direction = 1.0 if self._side == Side.UP else -1.0
+        if self._trade_type == "mr":
+            return self._manage_mr(tick)
+        else:
+            return self._manage_mom(tick)
 
-        # Profit take at extreme prices
-        if self._side == Side.UP and tick.up_mid > self._profit_take_high:
+    def _manage_mr(self, tick: Tick) -> Signal:
+        """
+        Mean reversion exit logic:
+        - Take profit when price returns toward 0.50 (target)
+        - Stop loss if price continues away from 0.50
+        """
+        # Profit take: price returned toward 0.50
+        if self._side == Side.DOWN:
+            # We shorted UP (bought DOWN) because up_mid was high
+            # Take profit when up_mid falls back toward 0.50
+            if tick.up_mid <= self._mr_target:
+                return self._go_flat(stop=False)
+            # Stop loss: up_mid continued higher
+            if tick.up_mid > self._entry_up_mid + self._mr_stop_move:
+                return self._go_flat(stop=True)
+
+        elif self._side == Side.UP:
+            # We bought UP because up_mid was low
+            # Take profit when up_mid rises back toward 0.50
+            if tick.up_mid >= (1.0 - self._mr_target):
+                return self._go_flat(stop=False)
+            # Stop loss: up_mid continued lower
+            if tick.up_mid < self._entry_up_mid - self._mr_stop_move:
+                return self._go_flat(stop=True)
+
+        # Per-trade stop loss backstop
+        current_bid = tick.up_bid if self._side == Side.UP else tick.down_bid
+        if self._entry_price > 0 and current_bid > 0:
+            trade_pnl = self._shares * (current_bid - self._entry_price)
+            if trade_pnl < -self._stop_loss_pct * self._entry_notional:
+                return self._go_flat(stop=True)
+
+        # Event stop loss
+        if self._current_cash < self._event_start_cash * (1.0 - self._event_max_loss):
+            self._stopped_out = True
+            return self._go_flat(stop=True)
+
+        return self._hold(tick)
+
+    def _manage_mom(self, tick: Tick) -> Signal:
+        """
+        Momentum exit logic:
+        - Profit take at extreme prices
+        - Stop loss on reversal
+        """
+        # Profit take
+        if self._side == Side.UP and tick.up_mid > self._mom_profit_take_high:
             return self._go_flat(stop=False)
-        if self._side == Side.DOWN and tick.up_mid < self._profit_take_low:
+        if self._side == Side.DOWN and tick.up_mid < self._mom_profit_take_low:
             return self._go_flat(stop=False)
+
+        # Momentum reversal exit
+        window = tick.up_mid_recent
+        if len(window) >= self._mom_lookback + 1:
+            past = window[-1 - self._mom_lookback]
+            now = window[-1]
+            if past > 0 and now > 0:
+                move = now - past
+                direction = 1.0 if self._side == Side.UP else -1.0
+                if direction * move < -self._mom_threshold:
+                    return self._go_flat(stop=False)
 
         # Per-trade stop loss
         current_bid = tick.up_bid if self._side == Side.UP else tick.down_bid
@@ -216,14 +329,49 @@ class ModelSubmission(Model):
             self._stopped_out = True
             return self._go_flat(stop=True)
 
-        # Check if momentum signal flipped direction
-        momentum_signal = self._polymarket_momentum(tick)
-        new_side, magnitude = momentum_signal
-        if new_side is not None and new_side != self._side and magnitude > 0:
-            # Momentum has reversed — exit
-            return self._go_flat(stop=False)
-
         return self._hold(tick)
+
+    # ------------------------------------------------------------------ #
+    #  Entry helpers                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _enter_mr(self, side: Side, ask: float, bid: float,
+                  up_mid_at_entry: float, size: float) -> Signal:
+        if ask <= 0 or bid <= 0 or ask <= bid:
+            return FLAT
+        size = self._clamp(size, 0.0, 0.40)
+        available = max(0.0, self._current_cash)
+        notional = min(size * self._capital, available)
+        if notional <= 0:
+            return FLAT
+        self._side = side
+        self._shares = notional / ask
+        self._entry_price = ask
+        self._entry_notional = notional
+        self._entry_up_mid = up_mid_at_entry
+        self._current_cash -= notional
+        self._ticks_since_exit = 0
+        self._trade_type = "mr"
+        return Signal(side=side, size=notional / self._capital, confidence=0.6)
+
+    def _enter_mom(self, side: Side, ask: float, bid: float,
+                   size: float) -> Signal:
+        if ask <= 0 or bid <= 0 or ask <= bid:
+            return FLAT
+        size = self._clamp(size, 0.0, 0.35)
+        available = max(0.0, self._current_cash)
+        notional = min(size * self._capital, available)
+        if notional <= 0:
+            return FLAT
+        self._side = side
+        self._shares = notional / ask
+        self._entry_price = ask
+        self._entry_notional = notional
+        self._entry_up_mid = 0.0
+        self._current_cash -= notional
+        self._ticks_since_exit = 0
+        self._trade_type = "mom"
+        return Signal(side=side, size=notional / self._capital, confidence=0.6)
 
     def _hold(self, tick: Tick) -> Signal:
         ask = tick.up_ask if self._side == Side.UP else tick.down_ask
@@ -235,12 +383,16 @@ class ModelSubmission(Model):
     def _go_flat(self, stop: bool = False) -> Signal:
         if self._side != Side.FLAT:
             self._current_cash += self._entry_notional
-            if stop:
-                self._ticks_since_stop = 0
+            self._ticks_since_exit = 0
+            self._cooldown_required = (
+                self._cooldown_stop if stop else self._cooldown_profit
+            )
         self._side = Side.FLAT
         self._shares = 0.0
         self._entry_price = 0.0
         self._entry_notional = 0.0
+        self._entry_up_mid = 0.0
+        self._trade_type = ""
         return FLAT
 
     def _book_valid(self, tick: Tick) -> bool:
